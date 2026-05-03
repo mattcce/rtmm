@@ -1,4 +1,4 @@
-//! Fast sampling from normal probability distribution.
+//! Fast sampling from standard normal probability distributions.
 use std::f32::consts::PI;
 
 use rand::prelude::*;
