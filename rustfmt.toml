@@ -1,0 +1,6 @@
+reorder_imports = true
+unstable_features = true
+wrap_comments = true
+comment_width = 80
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"
