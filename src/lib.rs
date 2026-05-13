@@ -1,4 +1,8 @@
 pub mod generator;
-pub mod matchmaker;
-pub mod scheduler;
+pub mod matchmaking;
+pub mod orchestration;
 pub mod validator;
+
+pub mod prelude {
+    pub use super::generator::prelude::*;
+}

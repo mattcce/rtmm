@@ -45,7 +45,8 @@ impl MatchmakingRequestGenerator {
     }
 }
 
-/// Skill rating random variable. Generates skill ratings from a normal distribution of mean 1000 and variance 200^2.
+/// Skill rating random variable. Generates skill ratings from a normal
+/// distribution of mean 1000 and variance 200^2.
 struct SkillRatingRandomVariable {
     generator: StandardNormalDistributionGenerator,
 }
@@ -69,8 +70,9 @@ impl SkillRatingRandomVariable {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashSet;
+
+    use super::*;
 
     fn generator() -> MatchmakingRequestGenerator {
         MatchmakingRequestGenerator::new()

@@ -27,7 +27,8 @@ impl ExponentialDistributionGenerator {
     }
 }
 
-/// Normal distribution generator for the N(0, 1) (standard normal) distribution.
+/// Normal distribution generator for the N(0, 1) (standard normal)
+/// distribution.
 pub struct StandardNormalDistributionGenerator {
     exponential_generator: ExponentialDistributionGenerator,
     uniform_generator: Box<dyn Rng>,
@@ -64,7 +65,8 @@ impl StandardNormalDistributionGenerator {
         }
     }
 
-    /// Computes the pdf of the standard normal distribution at a particular point.
+    /// Computes the pdf of the standard normal distribution at a particular
+    /// point.
     pub fn pdf(t: f32) -> f32 {
         (-0.5 * t * t).exp() / (2.0 * PI).sqrt()
     }
