@@ -1,4 +1,4 @@
-use std::cmp::{max, min};
+use std::cmp::max;
 use std::time::{Duration, SystemTime};
 
 use crate::matchmaking::config::MatchmakingQueueParameters;
@@ -33,10 +33,14 @@ pub fn compute_target_delta(
     let target_remaining_time = match ticket.oldest_request_timestamp {
         Some(oldest_request_timestamp) => max(
             Duration::from_nanos(1),
-            queue_parameters.expected_time_to_matching()
-                - (completion_timestamp
-                    .duration_since(oldest_request_timestamp)
-                    .unwrap()),
+            queue_parameters
+                .expected_time_to_matching()
+                .checked_sub(
+                    completion_timestamp
+                        .duration_since(oldest_request_timestamp)
+                        .unwrap(),
+                )
+                .unwrap_or(Duration::ZERO),
         ),
         None => queue_parameters.expected_time_to_matching(),
     };
@@ -89,13 +93,14 @@ pub fn compute_backoff_duration(
         ticket.delta,
     );
 
-    min(
-        Duration::from_secs_f64(MAXIMUM_BACKOFF_DURATION_SECONDS),
-        Duration::from_secs_f64(
-            queue_parameters.requests_per_matching() as f64
-                / (proportion * average_global_arrival_rate + f64::MIN_POSITIVE),
-        ),
-    )
+    let expected_wait_seconds = queue_parameters.requests_per_matching() as f64
+        / (proportion * average_global_arrival_rate + f64::MIN_POSITIVE);
+
+    if !expected_wait_seconds.is_finite() || expected_wait_seconds >= MAXIMUM_BACKOFF_DURATION_SECONDS {
+        Duration::from_secs_f64(MAXIMUM_BACKOFF_DURATION_SECONDS)
+    } else {
+        Duration::from_secs_f64(expected_wait_seconds)
+    }
 }
 
 /// Global control signals needed for resize and retry policies.
@@ -224,6 +229,38 @@ mod tests {
         };
         let feedback = feedback_with_rate(2, 4);
         let ticket = Ticket::new(1);
+
+        assert_eq!(
+            compute_backoff_duration(
+                &ticket,
+                &bookkeeping,
+                &queue_parameters,
+                &local_feedback,
+                &feedback,
+            ),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn backoff_duration_is_total_at_zero_observed_arrival_rate() {
+        let queue_parameters = MatchmakingQueueParameters::builder()
+            .skill_rating_range(300)
+            .bucket_width(100)
+            .build()
+            .unwrap();
+        let bookkeeping = SchedulerBookkeeping {
+            bucket_request_counts: vec![1, 0, 0].into_boxed_slice(),
+            proportion_table: vec![0.2, 0.5, 0.3].into_boxed_slice(),
+        };
+        let local_feedback = GroundAllocationSessionSummary {
+            successful_matchings: 0,
+            furthest_bucket_distance: 0,
+            completion_timestamp: UNIX_EPOCH + Duration::from_secs(10),
+            drained_counts: OffsetIndexedSlice::from_slice(&[0usize], 0, 0).unwrap(),
+        };
+        let feedback = SchedulerGlobalFeedback::new();
+        let ticket = Ticket::new(0);
 
         assert_eq!(
             compute_backoff_duration(

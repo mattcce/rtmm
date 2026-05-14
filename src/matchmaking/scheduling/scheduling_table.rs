@@ -126,9 +126,10 @@ impl SchedulingTable {
     }
 
     /// Assigns the next ticket, if available.
-    pub fn next_assignment(&mut self) -> Option<Assigned<'_>> {
+    pub fn next_assignment(&mut self) -> Option<Assigned> {
         while let Some(ticket) = SchedulingTable::next_ticket(&mut self.ready_queue) {
-            let result = SchedulingTable::try_acquire_lease(&self.request_matrix, &ticket.peek());
+            let result =
+                SchedulingTable::try_acquire_lease(&mut self.request_matrix, &ticket.peek());
             match result {
                 Ok(lease) => {
                     let anchor_bucket_index = ticket.peek().anchor_bucket_index();
@@ -160,12 +161,13 @@ impl SchedulingTable {
     pub fn readmit_assigned(
         &mut self,
         mut ticket: Assigned,
-        lease: Lease,
         local_feedback: GroundAllocationSessionSummary,
     ) {
         // update bookkeeping
         self.update_drained_counts(&ticket, &local_feedback);
-        SchedulingTable::update_oldest_request_timestamp(&lease, &mut ticket);
+        SchedulingTable::update_oldest_request_timestamp(&mut ticket);
+
+        // release buckets
 
         // flush contenders
         self.flush_contenders(ticket.anchor_bucket_index(), ticket.delta);
@@ -201,10 +203,21 @@ impl SchedulingTable {
 
         // check if the anchor bucket is empty
         match (backoff, ticket.oldest_request_timestamp) {
-            (Some(backoff_duration), _) => self
-                .wait_ticket(ticket.wait(local_feedback.completion_timestamp + backoff_duration)),
-            (None, Some(_)) => self.ready_ticket(ReadyPriority::Normal(ticket.ready())),
-            (None, None) => self.empty_ticket(ticket.empty()),
+            (Some(backoff_duration), _) => {
+                let ticket = ticket.wait(
+                    local_feedback.completion_timestamp + backoff_duration,
+                    &mut self.request_matrix,
+                );
+                self.wait_ticket(ticket);
+            }
+            (None, Some(_)) => {
+                let ticket = ReadyPriority::Normal(ticket.ready(&mut self.request_matrix));
+                self.ready_ticket(ticket);
+            }
+            (None, None) => {
+                let ticket = ticket.empty(&mut self.request_matrix);
+                self.empty_ticket(ticket);
+            }
         }
     }
 
@@ -287,10 +300,10 @@ impl SchedulingTable {
     }
 
     /// Acquires lease for a given ticket.
-    fn try_acquire_lease<'a, 'b>(
-        request_matrix: &'a RequestMatrix,
-        ticket: &'b Ticket,
-    ) -> Result<Lease<'a>, LeaseError> {
+    fn try_acquire_lease(
+        request_matrix: &mut RequestMatrix,
+        ticket: &Ticket,
+    ) -> Result<Lease, LeaseError> {
         Lease::try_acquire(request_matrix, ticket.anchor_bucket_index(), ticket.delta)
     }
 
@@ -323,8 +336,8 @@ impl SchedulingTable {
     }
 
     /// Updates new oldest request timing.
-    fn update_oldest_request_timestamp(lease: &Lease, ticket: &mut Ticket) {
-        ticket.oldest_request_timestamp = match lease.try_peek(0) {
+    fn update_oldest_request_timestamp(ticket: &mut Assigned) {
+        ticket.oldest_request_timestamp = match ticket.lease.try_peek(0) {
             Some(request) => Some(request.submission_timestamp),
             None => None,
         }
@@ -348,9 +361,9 @@ impl ReadyPriority {
 
     pub fn assign<'a>(
         self,
-        lease: Lease<'a>,
+        lease: Lease,
         eligible_request_counts: OffsetIndexedSlice<usize>,
-    ) -> Assigned<'a> {
+    ) -> Assigned {
         match self {
             ReadyPriority::Normal(ticket) => ticket.assigned(lease, eligible_request_counts),
             ReadyPriority::Contended(ticket) => ticket.assigned(lease, eligible_request_counts),
@@ -376,6 +389,8 @@ mod tests {
 
     use super::SchedulingTable;
     use crate::matchmaking::config::MatchmakingQueueParameters;
+    use crate::matchmaking::ground_allocation::{GroundAllocationControlSignals, GroundAllocator};
+    use crate::matchmaking::scheduling::Assigned;
     use crate::prelude::MatchmakingRequest;
 
     fn request(request_id: u32, skill_rating: u32) -> MatchmakingRequest {
@@ -393,6 +408,17 @@ mod tests {
             .delta_ceiling(2)
             .build()
             .unwrap()
+    }
+
+    fn control_signals(
+        assigned: &Assigned,
+        maximum_matchings: usize,
+    ) -> GroundAllocationControlSignals {
+        GroundAllocationControlSignals {
+            maximum_matchings,
+            requests_per_matching: 10,
+            window_eligible_request_counts: assigned.eligible_request_counts.map(|count| *count),
+        }
     }
 
     #[test]
@@ -414,5 +440,89 @@ mod tests {
         assert_eq!(assigned.delta, 0);
         assert_eq!(assigned.eligible_request_counts.get_offset(0), Some(&1));
         assert_eq!(assigned.lease.try_peek(0).unwrap().request_id, 1);
+    }
+
+    #[test]
+    fn ready_queue_prefers_oldest_anchor_request() {
+        let mut table = SchedulingTable::new(test_queue_parameters());
+
+        table
+            .post_request_batch(vec![request(2, 150), request(1, 50)])
+            .unwrap();
+
+        let assigned = table.next_assignment().unwrap();
+
+        assert_eq!(assigned.anchor_bucket_index(), 0);
+        assert_eq!(assigned.lease.try_peek(0).unwrap().request_id, 1);
+    }
+
+    #[test]
+    fn successful_readmission_requeues_anchor_with_refreshed_head() {
+        let mut table = SchedulingTable::new(test_queue_parameters());
+        let requests = (1..=20).map(|request_id| request(request_id, 50)).collect();
+
+        table.post_request_batch(requests).unwrap();
+
+        let (ticket, summary) = {
+            let assigned = table.next_assignment().unwrap();
+            let signals = control_signals(&assigned, 1);
+            let allocator = GroundAllocator::new(assigned, signals);
+            let (_matchings, assigned, summary) = allocator.run_allocation();
+            (assigned, summary)
+        };
+
+        table.readmit_assigned(ticket, summary);
+
+        let reassigned = table.next_assignment().unwrap();
+
+        assert_eq!(reassigned.anchor_bucket_index(), 0);
+        assert_eq!(reassigned.lease.try_peek(0).unwrap().request_id, 11);
+    }
+
+    #[test]
+    fn failed_readmission_waits_ticket_instead_of_immediate_reassignment() {
+        let mut table = SchedulingTable::new(test_queue_parameters());
+
+        table.post_request_batch(vec![request(1, 50)]).unwrap();
+
+        let (ticket, summary) = {
+            let assigned = table.next_assignment().unwrap();
+            let signals = control_signals(&assigned, 1);
+            let allocator = GroundAllocator::new(assigned, signals);
+            let (_matchings, assigned, summary) = allocator.run_allocation();
+            (assigned, summary)
+        };
+
+        assert_eq!(summary.successful_matchings, 0);
+
+        table.readmit_assigned(ticket, summary);
+
+        assert!(table.next_assignment().is_none());
+    }
+
+    #[test]
+    fn fully_drained_anchor_stays_empty_until_new_request_arrives() {
+        let mut table = SchedulingTable::new(test_queue_parameters());
+        let requests = (1..=10).map(|request_id| request(request_id, 50)).collect();
+
+        table.post_request_batch(requests).unwrap();
+
+        let (ticket, summary) = {
+            let assigned = table.next_assignment().unwrap();
+            let signals = control_signals(&assigned, 1);
+            let allocator = GroundAllocator::new(assigned, signals);
+            let (_matchings, assigned, summary) = allocator.run_allocation();
+            (assigned, summary)
+        };
+
+        table.readmit_assigned(ticket, summary);
+
+        assert!(table.next_assignment().is_none());
+
+        table.post_request_batch(vec![request(11, 50)]).unwrap();
+
+        let reassigned = table.next_assignment().unwrap();
+        assert_eq!(reassigned.anchor_bucket_index(), 0);
+        assert_eq!(reassigned.lease.try_peek(0).unwrap().request_id, 11);
     }
 }

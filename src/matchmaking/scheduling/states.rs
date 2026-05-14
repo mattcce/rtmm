@@ -8,6 +8,7 @@ use std::ops::{Deref, DerefMut};
 use std::time::SystemTime;
 
 use crate::matchmaking::scheduling::leases::Lease;
+use crate::matchmaking::scheduling::request_matrix::RequestMatrix;
 use crate::matchmaking::scheduling::tickets::Ticket;
 use crate::matchmaking::utils::OffsetIndexedSlice;
 
@@ -18,10 +19,15 @@ pub struct Waiting {
 }
 
 impl Waiting {
-    pub fn ready(self) -> Normal {
-        Normal {
-            ticket: self.ticket,
+    pub fn new(ticket: Ticket, next_readmission_timestamp: SystemTime) -> Waiting {
+        Waiting {
+            ticket,
+            next_readmission_timestamp,
         }
+    }
+
+    pub fn ready(self) -> Normal {
+        Normal::new(self.ticket)
     }
 
     #[inline]
@@ -72,6 +78,10 @@ pub struct Normal {
 }
 
 impl Normal {
+    pub fn new(ticket: Ticket) -> Normal {
+        Normal { ticket }
+    }
+
     pub fn contended(self) -> Contended {
         Contended {
             ticket: self.ticket,
@@ -130,34 +140,42 @@ impl PartialEq for Normal {
 impl Eq for Normal {}
 
 /// Thin operational wrapper for assigned tickets.
-pub struct Assigned<'a> {
+pub struct Assigned {
     pub ticket: Ticket,
-    pub lease: Lease<'a>,
+    pub lease: Lease,
     pub eligible_request_counts: OffsetIndexedSlice<usize>,
 }
 
-impl Assigned<'_> {
-    pub fn wait(self, until: SystemTime) -> Waiting {
-        Waiting {
-            ticket: self.ticket,
-            next_readmission_timestamp: until,
-        }
+impl Assigned {
+    pub fn wait(self, until: SystemTime, request_matrix: &mut RequestMatrix) -> Waiting {
+        request_matrix.release(
+            self.lease.into_buckets(),
+            self.ticket.anchor_bucket_index(),
+            self.ticket.delta,
+        );
+        Waiting::new(self.ticket, until)
     }
 
-    pub fn ready(self) -> Normal {
-        Normal {
-            ticket: self.ticket,
-        }
+    pub fn ready(self, request_matrix: &mut RequestMatrix) -> Normal {
+        request_matrix.release(
+            self.lease.into_buckets(),
+            self.ticket.anchor_bucket_index(),
+            self.ticket.delta,
+        );
+        Normal::new(self.ticket)
     }
 
-    pub fn empty(self) -> Empty {
-        Empty {
-            ticket: self.ticket,
-        }
+    pub fn empty(self, request_matrix: &mut RequestMatrix) -> Empty {
+        request_matrix.release(
+            self.lease.into_buckets(),
+            self.ticket.anchor_bucket_index(),
+            self.ticket.delta,
+        );
+        Empty::new(self.ticket)
     }
 }
 
-impl Deref for Assigned<'_> {
+impl Deref for Assigned {
     type Target = Ticket;
 
     fn deref(&self) -> &Self::Target {
@@ -165,7 +183,7 @@ impl Deref for Assigned<'_> {
     }
 }
 
-impl DerefMut for Assigned<'_> {
+impl DerefMut for Assigned {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.ticket
     }
@@ -239,10 +257,12 @@ pub struct Empty {
 }
 
 impl Empty {
+    pub fn new(ticket: Ticket) -> Empty {
+        Empty { ticket }
+    }
+
     pub fn ready(self) -> Normal {
-        Normal {
-            ticket: self.ticket,
-        }
+        Normal::new(self.ticket)
     }
 }
 
@@ -261,9 +281,7 @@ impl DerefMut for Empty {
 }
 
 pub fn new_empty_ticket(anchor_index: usize) -> Empty {
-    Empty {
-        ticket: Ticket::new(anchor_index),
-    }
+    Empty::new(Ticket::new(anchor_index))
 }
 
 #[cfg(test)]
@@ -288,20 +306,50 @@ mod tests {
 
     #[test]
     fn assigned_wait_transition_preserves_ticket_identity() {
-        let (request_matrix, _) = RequestMatrix::new(1, 1);
-        let lease = Lease::try_acquire(&request_matrix, 0, 0).unwrap();
+        let (mut request_matrix, _) = RequestMatrix::new(1, 1);
+        let lease = Lease::try_acquire(&mut request_matrix, 0, 0).unwrap();
         let eligible_request_counts = OffsetIndexedSlice::from_slice(&[1usize], 0, 0).unwrap();
 
         let waiting = new_empty_ticket(0)
             .ready()
             .assigned(lease, eligible_request_counts)
-            .wait(UNIX_EPOCH + Duration::from_secs(5));
+            .wait(UNIX_EPOCH + Duration::from_secs(5), &mut request_matrix);
 
         assert_eq!(waiting.anchor_bucket_index(), 0);
         assert_eq!(
             waiting.next_readmission_timestamp(),
             UNIX_EPOCH + Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn assigned_ready_releases_lease_and_preserves_ticket() {
+        let (mut request_matrix, _) = RequestMatrix::new(1, 1);
+        let lease = Lease::try_acquire(&mut request_matrix, 0, 0).unwrap();
+        let eligible_request_counts = OffsetIndexedSlice::from_slice(&[1usize], 0, 0).unwrap();
+
+        let normal = new_empty_ticket(0)
+            .ready()
+            .assigned(lease, eligible_request_counts)
+            .ready(&mut request_matrix);
+
+        assert_eq!(normal.anchor_bucket_index(), 0);
+        assert!(request_matrix.try_lease_window(0, 0).is_ok());
+    }
+
+    #[test]
+    fn assigned_empty_releases_lease_and_preserves_ticket() {
+        let (mut request_matrix, _) = RequestMatrix::new(1, 1);
+        let lease = Lease::try_acquire(&mut request_matrix, 0, 0).unwrap();
+        let eligible_request_counts = OffsetIndexedSlice::from_slice(&[0usize], 0, 0).unwrap();
+
+        let empty = new_empty_ticket(0)
+            .ready()
+            .assigned(lease, eligible_request_counts)
+            .empty(&mut request_matrix);
+
+        assert_eq!(empty.anchor_bucket_index(), 0);
+        assert!(request_matrix.try_lease_window(0, 0).is_ok());
     }
 
     #[test]

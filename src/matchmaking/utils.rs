@@ -1,5 +1,7 @@
 use std::cmp::min;
 
+/// Internal-only struct used for ease of computing bounds. Not part of the
+/// interface contract for OffsetIndexedSlice.
 struct MaterialisedBounds {
     start: usize,
     end_exclusive: usize,
@@ -159,8 +161,8 @@ impl<T> OffsetIndexedSlice<T> {
         }
     }
 
-    pub fn try_from_slice_map<'a, S, F: Fn(&'a T) -> Option<S>>(
-        container: &'a [T],
+    pub fn try_from_slice_map<'a, S, F: Fn(&'a mut T) -> Option<S>>(
+        container: &'a mut [T],
         base: usize,
         limit: usize,
         mapper: F,
@@ -175,7 +177,7 @@ impl<T> OffsetIndexedSlice<T> {
         let mut result = Vec::with_capacity(bounds.len());
 
         for (i, item) in container
-            .iter()
+            .iter_mut()
             .enumerate()
             .skip(bounds.start)
             .take(bounds.len())
@@ -363,7 +365,7 @@ mod tests {
     #[test]
     fn try_from_slice_map_succeeds_with_empty_overlap() {
         let view =
-            OffsetIndexedSlice::try_from_slice_map(&[1, 2, 3], 10, 2, |value| Some(value * 2))
+            OffsetIndexedSlice::try_from_slice_map(&mut [1, 2, 3], 10, 2, |value| Some(*value * 2))
                 .unwrap();
 
         assert_eq!(view.iter().count(), 0);
