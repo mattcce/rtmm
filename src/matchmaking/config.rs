@@ -167,7 +167,7 @@ impl MatchmakingQueueParametersBuilder {
         if self.expected_time_to_matching.is_zero() {
             return Err(MatchmakingQueueParametersBuildError::ZeroExpectedTimeToMatching);
         }
-        if self.skill_rating_range % self.bucket_width != 0 {
+        if !self.skill_rating_range.is_multiple_of(self.bucket_width) {
             return Err(MatchmakingQueueParametersBuildError::UnalignedBucketWidth);
         }
 
@@ -225,6 +225,39 @@ mod tests {
                 .build()
                 .unwrap_err(),
             MatchmakingQueueParametersBuildError::UnalignedBucketWidth
+        );
+    }
+
+    #[test]
+    fn builder_rejects_zero_skill_rating_range() {
+        assert_eq!(
+            MatchmakingQueueParameters::builder()
+                .skill_rating_range(0)
+                .build()
+                .unwrap_err(),
+            MatchmakingQueueParametersBuildError::ZeroSkillRatingRange
+        );
+    }
+
+    #[test]
+    fn builder_rejects_zero_requests_per_matching() {
+        assert_eq!(
+            MatchmakingQueueParameters::builder()
+                .requests_per_matching(0)
+                .build()
+                .unwrap_err(),
+            MatchmakingQueueParametersBuildError::ZeroRequestsPerMatching
+        );
+    }
+
+    #[test]
+    fn builder_rejects_zero_bucket_capacity() {
+        assert_eq!(
+            MatchmakingQueueParameters::builder()
+                .bucket_capacity(0)
+                .build()
+                .unwrap_err(),
+            MatchmakingQueueParametersBuildError::ZeroBucketCapacity
         );
     }
 

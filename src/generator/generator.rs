@@ -1,20 +1,29 @@
 //! Matchmaking request generation.
 
-use std::time::SystemTime;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 use super::sampling::StandardNormalDistributionGenerator;
+use crate::matchmaking::utils::now;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct MatchmakingRequest {
     pub request_id: u32,
     pub skill_rating: u32,
-    pub submission_timestamp: SystemTime,
+    pub submission_timestamp: Duration,
 }
 
 /// Matchmaking request generator.
 pub struct MatchmakingRequestGenerator {
     skill_rating_random_variable: SkillRatingRandomVariable,
     generated_sample_count: u32,
+}
+
+impl Default for MatchmakingRequestGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MatchmakingRequestGenerator {
@@ -30,7 +39,7 @@ impl MatchmakingRequestGenerator {
         MatchmakingRequest {
             request_id: self.generated_sample_count,
             skill_rating: self.skill_rating_random_variable.sample(),
-            submission_timestamp: SystemTime::now(),
+            submission_timestamp: now(),
         }
     }
 
@@ -114,6 +123,19 @@ mod tests {
         assert!(
             (mean_rating - 1000.0).abs() < 40.0,
             "expected mean skill rating near 1000, got {mean_rating}"
+        );
+    }
+
+    #[test]
+    fn submission_timestamps_are_monotonic() {
+        let mut generator = generator();
+
+        let first = generator.sample().submission_timestamp;
+        let second = generator.sample().submission_timestamp;
+
+        assert!(
+            second >= first,
+            "expected monotonic timestamps, got {first:?} then {second:?}"
         );
     }
 }

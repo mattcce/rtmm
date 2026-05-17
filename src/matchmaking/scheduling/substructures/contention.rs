@@ -5,25 +5,51 @@ use crate::matchmaking::utils::OffsetIndexedSlice;
 
 pub struct Contention {
     contenders: Box<[Vec<Contended>]>,
+    ticket_count: usize,
 }
 
 impl Contention {
     pub fn new(bucket_count: usize) -> Contention {
         let contenders = (0..bucket_count).map(|_| Vec::new()).collect();
 
-        Contention { contenders }
+        Contention {
+            contenders,
+            ticket_count: 0,
+        }
+    }
+
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.ticket_count
+    }
+
+    pub fn scan(&self) -> Box<[Vec<usize>]> {
+        let mut contended_tickets = Vec::with_capacity(self.contenders.len());
+
+        for cont in &self.contenders {
+            contended_tickets.push(
+                cont.iter()
+                    .map(|ticket| ticket.anchor_bucket_index())
+                    .collect(),
+            )
+        }
+
+        contended_tickets.into_boxed_slice()
     }
 
     pub fn contend_ticket(&mut self, contended: Contended, contended_bucket_index: usize) {
         self.contenders[contended_bucket_index].push(contended);
+        self.ticket_count += 1;
     }
 
-    pub fn flush_contenders<'a>(&'a mut self, base: usize, limit: usize) -> Vec<Contended> {
+    pub fn flush_contenders(&mut self, base: usize, limit: usize) -> Vec<Contended> {
         let mut flushed = Vec::new();
 
         OffsetIndexedSlice::new_mut_view(&mut self.contenders, base, limit)
-            .map_into(|contenders| contenders.drain(..).collect())
+            .map_into(std::mem::take)
             .map_in_place(|v| flushed.append(v));
+
+        self.ticket_count -= flushed.len();
 
         flushed
     }
@@ -53,5 +79,20 @@ mod tests {
         assert!(anchors.contains(&1));
         assert!(contention.flush_contenders(1, 1).is_empty());
         assert_eq!(contention.flush_contenders(4, 0).len(), 1);
+    }
+
+    #[test]
+    fn contended_ticket_is_stored_at_its_anchor_index() {
+        let mut contention = Contention::new(3);
+
+        contention.contend_ticket(new_empty_ticket(2).ready().contended(), 2);
+
+        // flushing with base=0, limit=1 should NOT include anchor=2
+        let flushed = contention.flush_contenders(0, 1);
+        assert!(flushed.is_empty());
+
+        // but flushing with base=2, limit=0 includes it
+        let flushed = contention.flush_contenders(2, 0);
+        assert_eq!(flushed.len(), 1);
     }
 }

@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::fmt::Display;
 
+use log::error;
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
@@ -44,14 +45,17 @@ impl RequestMatrix {
         anchor_index: usize,
         delta: usize,
     ) -> Result<OffsetIndexedSlice<RequestBucket>, LeaseError> {
-        match OffsetIndexedSlice::try_from_slice_map(
+        match OffsetIndexedSlice::try_from_slice_mut_map(
             &mut self.buckets,
             anchor_index,
             delta,
             |bucket: &mut Option<RequestBucket>| bucket.take(),
         ) {
             Ok(guards) => Ok(guards),
-            Err(index) => Err(LeaseError::ContentionError(index)),
+            Err((partial_lease, index)) => {
+                self.release(partial_lease, anchor_index, delta);
+                Err(LeaseError::ContentionError(index))
+            }
         }
     }
 
@@ -63,7 +67,7 @@ impl RequestMatrix {
         delta: usize,
     ) {
         OffsetIndexedSlice::new_mut_view(&mut self.buckets, anchor_index, delta)
-            .zip(buckets.map_into(|bucket| Some(bucket)))
+            .zip(buckets.map_into(Some))
             .map_in_place(|(t, u)| {
                 let _ = t.insert(u.take().unwrap());
             });
@@ -138,9 +142,15 @@ impl RequestBucket {
     }
 }
 
+impl Drop for RequestBucket {
+    fn drop(&mut self) {
+        error!("Request bucket dropped.");
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::Duration;
 
     use super::{LeaseError, PostError, RequestMatrix};
     use crate::prelude::MatchmakingRequest;
@@ -149,7 +159,7 @@ mod tests {
         MatchmakingRequest {
             request_id,
             skill_rating,
-            submission_timestamp: UNIX_EPOCH + Duration::from_secs(request_id as u64),
+            submission_timestamp: Duration::from_secs(request_id as u64),
         }
     }
 
@@ -218,14 +228,28 @@ mod tests {
         postbox.try_post(0, request(2, 100)).unwrap();
 
         let mut guards = request_matrix.try_lease_window(0, 0).unwrap();
-        assert_eq!(guards.get_offset(0).unwrap().try_peek().unwrap().request_id, 1);
+        assert_eq!(
+            guards.get_offset(0).unwrap().try_peek().unwrap().request_id,
+            1
+        );
         guards.get_offset_mut(0).unwrap().try_pop().unwrap();
 
         request_matrix.release(guards, 0, 0);
 
         let mut guards = request_matrix.try_lease_window(0, 0).unwrap();
-        assert_eq!(guards.get_offset(0).unwrap().try_peek().unwrap().request_id, 2);
-        assert_eq!(guards.get_offset_mut(0).unwrap().try_pop().unwrap().request_id, 2);
+        assert_eq!(
+            guards.get_offset(0).unwrap().try_peek().unwrap().request_id,
+            2
+        );
+        assert_eq!(
+            guards
+                .get_offset_mut(0)
+                .unwrap()
+                .try_pop()
+                .unwrap()
+                .request_id,
+            2
+        );
     }
 
     #[test]
@@ -241,9 +265,28 @@ mod tests {
         request_matrix.release(guards, 0, 0);
 
         let mut guards = request_matrix.try_lease_window(0, 0).unwrap();
-        assert_eq!(guards.get_offset(0).unwrap().try_peek().unwrap().request_id, 1);
-        assert_eq!(guards.get_offset_mut(0).unwrap().try_pop().unwrap().request_id, 1);
-        assert_eq!(guards.get_offset_mut(0).unwrap().try_pop().unwrap().request_id, 2);
+        assert_eq!(
+            guards.get_offset(0).unwrap().try_peek().unwrap().request_id,
+            1
+        );
+        assert_eq!(
+            guards
+                .get_offset_mut(0)
+                .unwrap()
+                .try_pop()
+                .unwrap()
+                .request_id,
+            1
+        );
+        assert_eq!(
+            guards
+                .get_offset_mut(0)
+                .unwrap()
+                .try_pop()
+                .unwrap()
+                .request_id,
+            2
+        );
     }
 
     #[test]
@@ -279,6 +322,23 @@ mod tests {
         let guards = request_matrix.try_lease_window(2, 2).unwrap();
         assert!(guards.get_offset(0).unwrap().try_peek().is_none());
         assert!(guards.get_offset(-2).unwrap().try_peek().is_some());
-        assert_eq!(guards.get_offset(2).unwrap().try_peek().unwrap().request_id, 5);
+        assert_eq!(
+            guards.get_offset(2).unwrap().try_peek().unwrap().request_id,
+            5
+        );
+    }
+
+    #[test]
+    fn post_overflow_does_not_affect_other_buckets() {
+        let (_, mut postbox) = RequestMatrix::new(2, 1);
+
+        // fill bucket 0
+        postbox.try_post(0, request(1, 100)).unwrap();
+
+        // overflow bucket 0 — should fail but not corrupt
+        assert!(postbox.try_post(0, request(2, 100)).is_err());
+
+        // bucket 1 should still accept posts
+        postbox.try_post(1, request(3, 200)).unwrap();
     }
 }

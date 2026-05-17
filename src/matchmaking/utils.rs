@@ -1,4 +1,9 @@
 use std::cmp::min;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub fn now() -> Duration {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
+}
 
 /// Internal-only struct used for ease of computing bounds. Not part of the
 /// interface contract for OffsetIndexedSlice.
@@ -111,15 +116,12 @@ impl<T> OffsetIndexedSlice<T> {
         let mut first_overlap_offset = None;
 
         for offset in -limit..=limit {
-            match (
+            if let (Some(t), Some(u)) = (
                 self_hold.get_offset_mut(offset),
                 other_hold.get_offset_mut(offset),
             ) {
-                (Some(t), Some(u)) => {
-                    first_overlap_offset.get_or_insert(offset);
-                    result.push((t.take().unwrap(), u.take().unwrap()));
-                }
-                _ => (),
+                first_overlap_offset.get_or_insert(offset);
+                result.push((t.take().unwrap(), u.take().unwrap()));
             }
         }
 
@@ -161,12 +163,12 @@ impl<T> OffsetIndexedSlice<T> {
         }
     }
 
-    pub fn try_from_slice_map<'a, S, F: Fn(&'a mut T) -> Option<S>>(
+    pub fn try_from_slice_mut_map<'a, S, F: Fn(&'a mut T) -> Option<S>>(
         container: &'a mut [T],
         base: usize,
         limit: usize,
         mapper: F,
-    ) -> Result<OffsetIndexedSlice<S>, usize> {
+    ) -> Result<OffsetIndexedSlice<S>, (OffsetIndexedSlice<S>, usize)> {
         let Ok(base) = i32::try_from(base) else {
             panic!();
         };
@@ -184,7 +186,16 @@ impl<T> OffsetIndexedSlice<T> {
         {
             match mapper(item) {
                 Some(s) => result.push(s),
-                None => return Err(i),
+                None => {
+                    return Err((
+                        OffsetIndexedSlice {
+                            container: result.into_boxed_slice(),
+                            base: bounds.base,
+                            limit,
+                        },
+                        i,
+                    ));
+                }
             }
         }
 
@@ -269,7 +280,7 @@ impl<T> OffsetIndexedSlice<T> {
         let bounds = self.materialised_bounds();
 
         for item in self.container.iter().skip(bounds.start).take(bounds.len()) {
-            mapper(&item)
+            mapper(item)
         }
     }
 
@@ -334,7 +345,12 @@ impl<T: Clone + 'static> OffsetIndexedSlice<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::OffsetIndexedSlice;
+    use super::{OffsetIndexedSlice, now};
+
+    #[test]
+    fn now_returns_non_negative_duration() {
+        assert!(now() >= std::time::Duration::ZERO);
+    }
 
     #[test]
     fn from_slice_clips_at_left_edge() {
@@ -364,9 +380,10 @@ mod tests {
 
     #[test]
     fn try_from_slice_map_succeeds_with_empty_overlap() {
-        let view =
-            OffsetIndexedSlice::try_from_slice_map(&mut [1, 2, 3], 10, 2, |value| Some(*value * 2))
-                .unwrap();
+        let view = OffsetIndexedSlice::try_from_slice_mut_map(&mut [1, 2, 3], 10, 2, |value| {
+            Some(*value * 2)
+        })
+        .unwrap();
 
         assert_eq!(view.iter().count(), 0);
     }

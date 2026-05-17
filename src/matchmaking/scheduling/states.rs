@@ -5,21 +5,23 @@
 //! them with additional state.
 
 use std::ops::{Deref, DerefMut};
-use std::time::SystemTime;
+use std::time::Duration;
 
+use crate::matchmaking::ground_allocation::{
+    GroundAllocationControlSignals, GroundAllocationSessionSummary,
+};
 use crate::matchmaking::scheduling::leases::Lease;
-use crate::matchmaking::scheduling::request_matrix::RequestMatrix;
 use crate::matchmaking::scheduling::tickets::Ticket;
-use crate::matchmaking::utils::OffsetIndexedSlice;
+use crate::matchmaking::utils::now;
 
 /// Thin operational wrapper for waiting tickets.
 pub struct Waiting {
     ticket: Ticket,
-    next_readmission_timestamp: SystemTime,
+    next_readmission_timestamp: Duration,
 }
 
 impl Waiting {
-    pub fn new(ticket: Ticket, next_readmission_timestamp: SystemTime) -> Waiting {
+    pub fn new(ticket: Ticket, next_readmission_timestamp: Duration) -> Waiting {
         Waiting {
             ticket,
             next_readmission_timestamp,
@@ -31,7 +33,7 @@ impl Waiting {
     }
 
     #[inline]
-    pub fn next_readmission_timestamp(&self) -> SystemTime {
+    pub fn next_readmission_timestamp(&self) -> Duration {
         self.next_readmission_timestamp
     }
 }
@@ -60,7 +62,7 @@ impl Ord for Waiting {
 
 impl PartialOrd for Waiting {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(&other))
+        Some(self.cmp(other))
     }
 }
 
@@ -85,19 +87,19 @@ impl Normal {
     pub fn contended(self) -> Contended {
         Contended {
             ticket: self.ticket,
-            contention_start_timestamp: SystemTime::now(),
+            contention_start_timestamp: now(),
         }
     }
 
     pub fn assigned(
         self,
         lease: Lease,
-        eligible_request_counts: OffsetIndexedSlice<usize>,
+        ground_allocation_control_signals: GroundAllocationControlSignals,
     ) -> Assigned {
         Assigned {
             ticket: self.ticket,
             lease,
-            eligible_request_counts,
+            ground_allocation_control_signals,
         }
     }
 }
@@ -127,7 +129,7 @@ impl Ord for Normal {
 
 impl PartialOrd for Normal {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(&other))
+        Some(self.cmp(other))
     }
 }
 
@@ -143,35 +145,16 @@ impl Eq for Normal {}
 pub struct Assigned {
     pub ticket: Ticket,
     pub lease: Lease,
-    pub eligible_request_counts: OffsetIndexedSlice<usize>,
+    pub ground_allocation_control_signals: GroundAllocationControlSignals,
 }
 
 impl Assigned {
-    pub fn wait(self, until: SystemTime, request_matrix: &mut RequestMatrix) -> Waiting {
-        request_matrix.release(
-            self.lease.into_buckets(),
-            self.ticket.anchor_bucket_index(),
-            self.ticket.delta,
-        );
-        Waiting::new(self.ticket, until)
-    }
-
-    pub fn ready(self, request_matrix: &mut RequestMatrix) -> Normal {
-        request_matrix.release(
-            self.lease.into_buckets(),
-            self.ticket.anchor_bucket_index(),
-            self.ticket.delta,
-        );
-        Normal::new(self.ticket)
-    }
-
-    pub fn empty(self, request_matrix: &mut RequestMatrix) -> Empty {
-        request_matrix.release(
-            self.lease.into_buckets(),
-            self.ticket.anchor_bucket_index(),
-            self.ticket.delta,
-        );
-        Empty::new(self.ticket)
+    pub fn complete(self, local_feedback: GroundAllocationSessionSummary) -> Completed {
+        Completed {
+            ticket: self.ticket,
+            lease: Some(self.lease),
+            local_feedback,
+        }
     }
 }
 
@@ -192,19 +175,19 @@ impl DerefMut for Assigned {
 /// Thin operational wrapper for contended tickets.
 pub struct Contended {
     ticket: Ticket,
-    contention_start_timestamp: SystemTime,
+    contention_start_timestamp: Duration,
 }
 
 impl Contended {
     pub fn assigned(
         self,
         lease: Lease,
-        eligible_request_counts: OffsetIndexedSlice<usize>,
+        ground_allocation_control_signals: GroundAllocationControlSignals,
     ) -> Assigned {
         Assigned {
             ticket: self.ticket,
             lease,
-            eligible_request_counts,
+            ground_allocation_control_signals,
         }
     }
 }
@@ -238,7 +221,7 @@ impl Ord for Contended {
 
 impl PartialOrd for Contended {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(&other))
+        Some(self.cmp(other))
     }
 }
 
@@ -252,6 +235,7 @@ impl PartialEq for Contended {
 impl Eq for Contended {}
 
 /// Thin operational wrapper for empty tickets.
+#[derive(Debug)]
 pub struct Empty {
     ticket: Ticket,
 }
@@ -280,6 +264,46 @@ impl DerefMut for Empty {
     }
 }
 
+/// Thin operational wrapper for completed tickets.
+/// The lease must be extracted and freed manually, or the state transition will
+/// force panic.
+pub struct Completed {
+    pub ticket: Ticket,
+    pub lease: Option<Lease>,
+    pub local_feedback: GroundAllocationSessionSummary,
+}
+
+impl Completed {
+    pub fn wait(self, until: Duration) -> Waiting {
+        assert!(self.lease.is_none());
+        Waiting::new(self.ticket, until)
+    }
+
+    pub fn ready(self) -> Normal {
+        assert!(self.lease.is_none());
+        Normal::new(self.ticket)
+    }
+
+    pub fn empty(self) -> Empty {
+        assert!(self.lease.is_none());
+        Empty::new(self.ticket)
+    }
+}
+
+impl Deref for Completed {
+    type Target = Ticket;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ticket
+    }
+}
+
+impl DerefMut for Completed {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ticket
+    }
+}
+
 pub fn new_empty_ticket(anchor_index: usize) -> Empty {
     Empty::new(Ticket::new(anchor_index))
 }
@@ -287,11 +311,15 @@ pub fn new_empty_ticket(anchor_index: usize) -> Empty {
 #[cfg(test)]
 mod tests {
     use std::collections::BinaryHeap;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::Duration;
 
     use super::{Contended, Normal, Waiting, new_empty_ticket};
+    use crate::matchmaking::ground_allocation::{
+        GroundAllocationControlSignals, GroundAllocationSessionSummary,
+    };
     use crate::matchmaking::scheduling::leases::Lease;
     use crate::matchmaking::scheduling::request_matrix::RequestMatrix;
+    use crate::matchmaking::scheduling::scheduling_table::ReadyPriority;
     use crate::matchmaking::scheduling::tickets::Ticket;
     use crate::matchmaking::utils::OffsetIndexedSlice;
 
@@ -308,30 +336,69 @@ mod tests {
     fn assigned_wait_transition_preserves_ticket_identity() {
         let (mut request_matrix, _) = RequestMatrix::new(1, 1);
         let lease = Lease::try_acquire(&mut request_matrix, 0, 0).unwrap();
-        let eligible_request_counts = OffsetIndexedSlice::from_slice(&[1usize], 0, 0).unwrap();
+        let window_eligible_request_counts =
+            OffsetIndexedSlice::from_slice(&[1usize], 0, 0).unwrap();
+        let signals = GroundAllocationControlSignals {
+            maximum_matchings: 1,
+            requests_per_matching: 10,
+            window_eligible_request_counts,
+        };
+        let summary = GroundAllocationSessionSummary {
+            successful_matchings: 0,
+            furthest_bucket_distance: 0,
+            completion_timestamp: Duration::ZERO,
+            drained_counts: OffsetIndexedSlice::from_slice(&[0usize], 0, 0).unwrap(),
+        };
 
-        let waiting = new_empty_ticket(0)
+        let mut completed = new_empty_ticket(0)
             .ready()
-            .assigned(lease, eligible_request_counts)
-            .wait(UNIX_EPOCH + Duration::from_secs(5), &mut request_matrix);
+            .assigned(lease, signals)
+            .complete(summary);
+
+        let lease = completed.lease.take().unwrap();
+        request_matrix.release(
+            lease.into_buckets(),
+            completed.anchor_bucket_index(),
+            completed.delta,
+        );
+
+        let waiting = completed.wait(Duration::from_secs(5));
 
         assert_eq!(waiting.anchor_bucket_index(), 0);
-        assert_eq!(
-            waiting.next_readmission_timestamp(),
-            UNIX_EPOCH + Duration::from_secs(5)
-        );
+        assert_eq!(waiting.next_readmission_timestamp(), Duration::from_secs(5));
     }
 
     #[test]
     fn assigned_ready_releases_lease_and_preserves_ticket() {
         let (mut request_matrix, _) = RequestMatrix::new(1, 1);
         let lease = Lease::try_acquire(&mut request_matrix, 0, 0).unwrap();
-        let eligible_request_counts = OffsetIndexedSlice::from_slice(&[1usize], 0, 0).unwrap();
+        let window_eligible_request_counts =
+            OffsetIndexedSlice::from_slice(&[1usize], 0, 0).unwrap();
+        let signals = GroundAllocationControlSignals {
+            maximum_matchings: 1,
+            requests_per_matching: 10,
+            window_eligible_request_counts,
+        };
+        let summary = GroundAllocationSessionSummary {
+            successful_matchings: 0,
+            furthest_bucket_distance: 0,
+            completion_timestamp: Duration::ZERO,
+            drained_counts: OffsetIndexedSlice::from_slice(&[0usize], 0, 0).unwrap(),
+        };
 
-        let normal = new_empty_ticket(0)
+        let mut completed = new_empty_ticket(0)
             .ready()
-            .assigned(lease, eligible_request_counts)
-            .ready(&mut request_matrix);
+            .assigned(lease, signals)
+            .complete(summary);
+
+        let lease = completed.lease.take().unwrap();
+        request_matrix.release(
+            lease.into_buckets(),
+            completed.anchor_bucket_index(),
+            completed.delta,
+        );
+
+        let normal = completed.ready();
 
         assert_eq!(normal.anchor_bucket_index(), 0);
         assert!(request_matrix.try_lease_window(0, 0).is_ok());
@@ -341,12 +408,33 @@ mod tests {
     fn assigned_empty_releases_lease_and_preserves_ticket() {
         let (mut request_matrix, _) = RequestMatrix::new(1, 1);
         let lease = Lease::try_acquire(&mut request_matrix, 0, 0).unwrap();
-        let eligible_request_counts = OffsetIndexedSlice::from_slice(&[0usize], 0, 0).unwrap();
+        let window_eligible_request_counts =
+            OffsetIndexedSlice::from_slice(&[0usize], 0, 0).unwrap();
+        let signals = GroundAllocationControlSignals {
+            maximum_matchings: 1,
+            requests_per_matching: 10,
+            window_eligible_request_counts,
+        };
+        let summary = GroundAllocationSessionSummary {
+            successful_matchings: 0,
+            furthest_bucket_distance: 0,
+            completion_timestamp: Duration::ZERO,
+            drained_counts: OffsetIndexedSlice::from_slice(&[0usize], 0, 0).unwrap(),
+        };
 
-        let empty = new_empty_ticket(0)
+        let mut completed = new_empty_ticket(0)
             .ready()
-            .assigned(lease, eligible_request_counts)
-            .empty(&mut request_matrix);
+            .assigned(lease, signals)
+            .complete(summary);
+
+        let lease = completed.lease.take().unwrap();
+        request_matrix.release(
+            lease.into_buckets(),
+            completed.anchor_bucket_index(),
+            completed.delta,
+        );
+
+        let empty = completed.empty();
 
         assert_eq!(empty.anchor_bucket_index(), 0);
         assert!(request_matrix.try_lease_window(0, 0).is_ok());
@@ -358,11 +446,11 @@ mod tests {
 
         heap.push(Waiting {
             ticket: Ticket::new(0),
-            next_readmission_timestamp: UNIX_EPOCH + Duration::from_secs(10),
+            next_readmission_timestamp: Duration::from_secs(10),
         });
         heap.push(Waiting {
             ticket: Ticket::new(1),
-            next_readmission_timestamp: UNIX_EPOCH + Duration::from_secs(5),
+            next_readmission_timestamp: Duration::from_secs(5),
         });
 
         assert_eq!(heap.pop().unwrap().anchor_bucket_index(), 1);
@@ -373,9 +461,9 @@ mod tests {
         let mut heap = BinaryHeap::new();
 
         let mut newer = Ticket::new(0);
-        newer.oldest_request_timestamp = Some(UNIX_EPOCH + Duration::from_secs(10));
+        newer.oldest_request_timestamp = Some(Duration::from_secs(10));
         let mut older = Ticket::new(1);
-        older.oldest_request_timestamp = Some(UNIX_EPOCH + Duration::from_secs(5));
+        older.oldest_request_timestamp = Some(Duration::from_secs(5));
 
         heap.push(Normal { ticket: newer });
         heap.push(Normal { ticket: older });
@@ -388,19 +476,126 @@ mod tests {
         let mut heap = BinaryHeap::new();
 
         let mut shorter_wait = Ticket::new(0);
-        shorter_wait.oldest_request_timestamp = Some(UNIX_EPOCH + Duration::from_secs(3));
+        shorter_wait.oldest_request_timestamp = Some(Duration::from_secs(3));
         let mut longer_wait = Ticket::new(1);
-        longer_wait.oldest_request_timestamp = Some(UNIX_EPOCH + Duration::from_secs(4));
+        longer_wait.oldest_request_timestamp = Some(Duration::from_secs(4));
 
         heap.push(Contended {
             ticket: shorter_wait,
-            contention_start_timestamp: UNIX_EPOCH + Duration::from_secs(10),
+            contention_start_timestamp: Duration::from_secs(10),
         });
         heap.push(Contended {
             ticket: longer_wait,
-            contention_start_timestamp: UNIX_EPOCH + Duration::from_secs(5),
+            contention_start_timestamp: Duration::from_secs(5),
         });
 
         assert_eq!(heap.pop().unwrap().anchor_bucket_index(), 1);
+    }
+
+    #[test]
+    fn contended_to_completed_to_ready_cycle() {
+        let (mut request_matrix, _) = RequestMatrix::new(1, 1);
+        let lease = Lease::try_acquire(&mut request_matrix, 0, 0).unwrap();
+        let window_eligible_request_counts =
+            OffsetIndexedSlice::from_slice(&[1usize], 0, 0).unwrap();
+        let signals = GroundAllocationControlSignals {
+            maximum_matchings: 1,
+            requests_per_matching: 10,
+            window_eligible_request_counts,
+        };
+
+        let contended = new_empty_ticket(0).ready().contended();
+        assert_eq!(contended.anchor_bucket_index(), 0);
+
+        let mut completed =
+            contended
+                .assigned(lease, signals)
+                .complete(GroundAllocationSessionSummary {
+                    successful_matchings: 0,
+                    furthest_bucket_distance: 0,
+                    completion_timestamp: Duration::ZERO,
+                    drained_counts: OffsetIndexedSlice::from_slice(&[0usize], 0, 0).unwrap(),
+                });
+
+        let lease = completed.lease.take().unwrap();
+        request_matrix.release(
+            lease.into_buckets(),
+            completed.anchor_bucket_index(),
+            completed.delta,
+        );
+
+        let ready = completed.ready();
+        assert_eq!(ready.anchor_bucket_index(), 0);
+        assert!(request_matrix.try_lease_window(0, 0).is_ok());
+    }
+
+    #[test]
+    fn mixed_ready_priority_contended_before_normal() {
+        let mut heap = BinaryHeap::new();
+
+        let mut late_ticket = Ticket::new(0);
+        late_ticket.oldest_request_timestamp = Some(Duration::from_secs(1));
+
+        let mut contended_ticket = Ticket::new(1);
+        contended_ticket.oldest_request_timestamp = Some(Duration::from_secs(100));
+
+        heap.push(ReadyPriority::Normal(Normal {
+            ticket: late_ticket,
+        }));
+        heap.push(ReadyPriority::Contended(Contended {
+            ticket: contended_ticket,
+            contention_start_timestamp: Duration::from_secs(100),
+        }));
+
+        assert_eq!(heap.pop().unwrap().peek().anchor_bucket_index(), 1);
+    }
+
+    #[test]
+    fn normal_same_timestamp_is_stable_in_heap() {
+        let mut heap = BinaryHeap::new();
+
+        let mut ticket_a = Ticket::new(2);
+        ticket_a.oldest_request_timestamp = Some(Duration::from_secs(10));
+        let mut ticket_b = Ticket::new(5);
+        ticket_b.oldest_request_timestamp = Some(Duration::from_secs(10));
+
+        heap.push(Normal { ticket: ticket_a });
+        heap.push(Normal { ticket: ticket_b });
+
+        // same timestamp — both should pop without panic
+        let first = heap.pop().unwrap();
+        let second = heap.pop().unwrap();
+        assert!(heap.is_empty());
+
+        // both present; ordering between equal-timestamp Normals is not guaranteed
+        let anchors: Vec<_> = [first.anchor_bucket_index(), second.anchor_bucket_index()]
+            .into_iter()
+            .collect();
+        assert!(anchors.contains(&2));
+        assert!(anchors.contains(&5));
+    }
+
+    #[test]
+    #[should_panic]
+    fn completed_wait_panics_without_releasing_lease() {
+        let (mut request_matrix, _) = RequestMatrix::new(1, 1);
+        let lease = Lease::try_acquire(&mut request_matrix, 0, 0).unwrap();
+        let summary = GroundAllocationSessionSummary {
+            successful_matchings: 0,
+            furthest_bucket_distance: 0,
+            completion_timestamp: Duration::ZERO,
+            drained_counts: OffsetIndexedSlice::from_slice(&[0usize], 0, 0).unwrap(),
+        };
+
+        let completed = new_empty_ticket(0)
+            .ready()
+            .assigned(lease, GroundAllocationControlSignals {
+                maximum_matchings: 1,
+                requests_per_matching: 10,
+                window_eligible_request_counts: OffsetIndexedSlice::from_slice(&[1usize], 0, 0).unwrap(),
+            })
+            .complete(summary);
+
+        let _ = completed.wait(Duration::from_secs(5));
     }
 }

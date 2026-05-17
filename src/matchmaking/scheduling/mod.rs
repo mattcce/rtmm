@@ -6,4 +6,4 @@ mod states;
 mod substructures;
 pub mod tickets;
 
-pub use states::Assigned;
+pub use states::{Assigned, Completed};

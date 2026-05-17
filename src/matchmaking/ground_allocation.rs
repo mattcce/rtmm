@@ -1,60 +1,55 @@
 //! Ground allocation algorithm.
 
 use std::cmp::min;
-use std::time::SystemTime;
+use std::time::Duration;
 
-use crate::matchmaking::scheduling::Assigned;
-use crate::matchmaking::utils::OffsetIndexedSlice;
+use crate::matchmaking::scheduling::{Assigned, Completed};
+use crate::matchmaking::utils::{OffsetIndexedSlice, now};
 use crate::validator::validator::MatchmakingAssignment;
 
 /// Ground allocator.
 /// Corresponds to a single ground allocation session.
 pub struct GroundAllocator {
     ticket: Assigned,
-    control_signals: GroundAllocationControlSignals,
 }
 
-impl<'a> GroundAllocator {
-    pub fn new(
-        ticket: Assigned,
-        control_signals: GroundAllocationControlSignals,
-    ) -> GroundAllocator {
-        GroundAllocator {
-            ticket,
-            control_signals,
-        }
+impl GroundAllocator {
+    pub fn new(ticket: Assigned) -> GroundAllocator {
+        GroundAllocator { ticket }
     }
 
     /// Runs the ground allocation algorithm.
-    pub fn run_allocation(
-        mut self,
-    ) -> (
-        Vec<MatchmakingAssignment>,
-        Assigned,
-        GroundAllocationSessionSummary,
-    ) {
+    pub fn run_allocation(mut self) -> (Vec<MatchmakingAssignment>, Completed) {
+        let Assigned {
+            ticket,
+            ground_allocation_control_signals,
+            lease,
+        } = &mut self.ticket;
+
         let mut successful_matchings = 0;
         let mut furthest_bucket_distance = 0;
 
         let mut matchings = Vec::new();
-        let mut drained_counts = self
-            .control_signals
+        let mut drained_counts = ground_allocation_control_signals
             .window_eligible_request_counts
             .map(|_| 0);
 
         // allocate for anchor bin first
         // compute number of possible complete matchings for anchor bin
         let anchor_local_allocations = min(
-            self.control_signals.maximum_matchings,
-            self.control_signals.get_eligible_request_count(0).unwrap()
-                / self.control_signals.requests_per_matching,
+            ground_allocation_control_signals.maximum_matchings,
+            ground_allocation_control_signals
+                .get_eligible_request_count(0)
+                .unwrap()
+                / ground_allocation_control_signals.requests_per_matching,
         );
 
         // batch allocate from anchor bin
         for _ in 0..anchor_local_allocations {
-            let mut matching = Vec::with_capacity(self.control_signals.requests_per_matching);
-            for _ in 0..self.control_signals.requests_per_matching {
-                matching.push(self.ticket.lease.try_pop(0).unwrap());
+            let mut matching =
+                Vec::with_capacity(ground_allocation_control_signals.requests_per_matching);
+            for _ in 0..ground_allocation_control_signals.requests_per_matching {
+                matching.push(lease.try_pop(0).unwrap());
             }
             matchings.push(MatchmakingAssignment {
                 grouped_requests: matching,
@@ -64,9 +59,8 @@ impl<'a> GroundAllocator {
         // update bookkeeping
         successful_matchings += anchor_local_allocations;
         *drained_counts.get_offset_mut(0).unwrap() +=
-            anchor_local_allocations * self.control_signals.requests_per_matching;
-        *self
-            .control_signals
+            anchor_local_allocations * ground_allocation_control_signals.requests_per_matching;
+        *ground_allocation_control_signals
             .window_eligible_request_counts
             .get_offset_mut(0)
             .unwrap() -= drained_counts.get_offset(0).unwrap();
@@ -74,25 +68,25 @@ impl<'a> GroundAllocator {
         // allocate using full window, starting from anchor
         // verify that there are sufficient requests and room for precisely one more
         // matching
-        if successful_matchings < self.control_signals.maximum_matchings
-            && self
-                .control_signals
+        if successful_matchings < ground_allocation_control_signals.maximum_matchings
+            && ground_allocation_control_signals
                 .window_eligible_request_counts
                 .iter()
                 .sum::<usize>()
-                >= self.control_signals.requests_per_matching
+                >= ground_allocation_control_signals.requests_per_matching
         {
             // alternate between positive and negative edge of expanding window
             let mut direction = 1;
             let mut current_absolute_offset = 0;
-            let mut matching = Vec::with_capacity(self.control_signals.requests_per_matching);
+            let mut matching =
+                Vec::with_capacity(ground_allocation_control_signals.requests_per_matching);
             let mut failed_at_current_offset = false;
 
-            while matching.len() < self.control_signals.requests_per_matching
-                && current_absolute_offset <= self.ticket.delta
+            while matching.len() < ground_allocation_control_signals.requests_per_matching
+                && current_absolute_offset <= ticket.delta
             {
                 let offset = current_absolute_offset as i32 * direction;
-                match self.ticket.lease.try_pop(offset) {
+                match lease.try_pop(offset) {
                     Some(request) => {
                         matching.push(request);
                         *drained_counts.get_offset_mut(offset).unwrap() += 1;
@@ -123,11 +117,11 @@ impl<'a> GroundAllocator {
         let summary = GroundAllocationSessionSummary {
             successful_matchings,
             furthest_bucket_distance,
-            completion_timestamp: SystemTime::now(),
+            completion_timestamp: now(),
             drained_counts,
         };
 
-        (matchings, self.ticket, summary)
+        (matchings, self.ticket.complete(summary))
     }
 }
 
@@ -151,13 +145,13 @@ impl GroundAllocationControlSignals {
 pub struct GroundAllocationSessionSummary {
     pub successful_matchings: usize,
     pub furthest_bucket_distance: usize,
-    pub completion_timestamp: SystemTime,
+    pub completion_timestamp: Duration,
     pub drained_counts: OffsetIndexedSlice<usize>,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::Duration;
 
     use super::*;
     use crate::matchmaking::scheduling::leases::Lease;
@@ -169,7 +163,7 @@ mod tests {
         MatchmakingRequest {
             request_id,
             skill_rating,
-            submission_timestamp: UNIX_EPOCH + Duration::from_secs(request_id as u64),
+            submission_timestamp: Duration::from_secs(request_id as u64),
         }
     }
 
@@ -188,25 +182,18 @@ mod tests {
         eligible: &[usize],
     ) -> Assigned {
         let lease = Lease::try_acquire(matrix, anchor, delta).unwrap();
-        let eligible_counts = OffsetIndexedSlice::from_slice(eligible, anchor, delta).unwrap();
+        let window_eligible_request_counts =
+            OffsetIndexedSlice::from_slice(eligible, anchor, delta).unwrap();
         let mut ticket = Ticket::new(anchor);
         ticket.delta = delta;
         Assigned {
             ticket,
             lease,
-            eligible_request_counts: eligible_counts,
-        }
-    }
-
-    fn signals(
-        assigned: &Assigned,
-        maximum_matchings: usize,
-        requests_per_matching: usize,
-    ) -> GroundAllocationControlSignals {
-        GroundAllocationControlSignals {
-            maximum_matchings,
-            requests_per_matching,
-            window_eligible_request_counts: assigned.eligible_request_counts.map(|count| *count),
+            ground_allocation_control_signals: GroundAllocationControlSignals {
+                maximum_matchings: 1,
+                requests_per_matching: 10,
+                window_eligible_request_counts,
+            },
         }
     }
 
@@ -216,15 +203,21 @@ mod tests {
         populate_bucket(&mut postbox, 1, 12);
 
         let assigned = make_assigned(&mut matrix, 1, 0, &[0, 12, 0]);
-        let sig = signals(&assigned, 1, 10);
-        let allocator = GroundAllocator::new(assigned, sig);
-        let (matchings, _assigned, summary) = allocator.run_allocation();
+        let allocator = GroundAllocator::new(assigned);
+        let (matchings, completed) = allocator.run_allocation();
 
         assert_eq!(matchings.len(), 1);
         assert_eq!(matchings[0].grouped_requests.len(), 10);
-        assert_eq!(summary.successful_matchings, 1);
-        assert_eq!(summary.furthest_bucket_distance, 0);
-        assert_eq!(*summary.drained_counts.get_offset(0).unwrap(), 10);
+        assert_eq!(completed.local_feedback.successful_matchings, 1);
+        assert_eq!(completed.local_feedback.furthest_bucket_distance, 0);
+        assert_eq!(
+            *completed
+                .local_feedback
+                .drained_counts
+                .get_offset(0)
+                .unwrap(),
+            10
+        );
     }
 
     #[test]
@@ -235,17 +228,37 @@ mod tests {
         populate_bucket(&mut postbox, 3, 20);
 
         let assigned = make_assigned(&mut matrix, 2, 1, &[0, 20, 20, 20, 0]);
-        let sig = signals(&assigned, 1, 10);
-        let allocator = GroundAllocator::new(assigned, sig);
-        let (matchings, _assigned, summary) = allocator.run_allocation();
+        let allocator = GroundAllocator::new(assigned);
+        let (matchings, completed) = allocator.run_allocation();
 
         assert_eq!(matchings.len(), 1);
         assert_eq!(matchings[0].grouped_requests.len(), 10);
-        assert_eq!(summary.successful_matchings, 1);
-        assert_eq!(summary.furthest_bucket_distance, 0);
-        assert_eq!(*summary.drained_counts.get_offset(0).unwrap(), 10);
-        assert_eq!(*summary.drained_counts.get_offset(-1).unwrap(), 0);
-        assert_eq!(*summary.drained_counts.get_offset(1).unwrap(), 0);
+        assert_eq!(completed.local_feedback.successful_matchings, 1);
+        assert_eq!(completed.local_feedback.furthest_bucket_distance, 0);
+        assert_eq!(
+            *completed
+                .local_feedback
+                .drained_counts
+                .get_offset(0)
+                .unwrap(),
+            10
+        );
+        assert_eq!(
+            *completed
+                .local_feedback
+                .drained_counts
+                .get_offset(-1)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            *completed
+                .local_feedback
+                .drained_counts
+                .get_offset(1)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -256,14 +269,13 @@ mod tests {
         populate_bucket(&mut postbox, 3, 4);
 
         let assigned = make_assigned(&mut matrix, 2, 2, &[0, 4, 4, 4, 0]);
-        let sig = signals(&assigned, 1, 10);
-        let allocator = GroundAllocator::new(assigned, sig);
-        let (matchings, _assigned, summary) = allocator.run_allocation();
+        let allocator = GroundAllocator::new(assigned);
+        let (matchings, completed) = allocator.run_allocation();
 
         assert_eq!(matchings.len(), 1);
         assert_eq!(matchings[0].grouped_requests.len(), 10);
-        assert_eq!(summary.successful_matchings, 1);
-        assert!(summary.furthest_bucket_distance >= 1);
+        assert_eq!(completed.local_feedback.successful_matchings, 1);
+        assert!(completed.local_feedback.furthest_bucket_distance >= 1);
     }
 
     #[test]
@@ -271,14 +283,14 @@ mod tests {
         let (mut matrix, mut postbox) = RequestMatrix::new(3, 30);
         populate_bucket(&mut postbox, 1, 25);
 
-        let assigned = make_assigned(&mut matrix, 1, 0, &[0, 25, 0]);
-        let sig = signals(&assigned, 2, 10);
-        let allocator = GroundAllocator::new(assigned, sig);
-        let (matchings, _assigned, summary) = allocator.run_allocation();
+        let mut assigned = make_assigned(&mut matrix, 1, 0, &[0, 25, 0]);
+        assigned.ground_allocation_control_signals.maximum_matchings = 2;
+        let allocator = GroundAllocator::new(assigned);
+        let (matchings, completed) = allocator.run_allocation();
 
         assert_eq!(matchings.len(), 2);
-        assert_eq!(summary.successful_matchings, 2);
-        assert_eq!(summary.furthest_bucket_distance, 0);
+        assert_eq!(completed.local_feedback.successful_matchings, 2);
+        assert_eq!(completed.local_feedback.furthest_bucket_distance, 0);
     }
 
     #[test]
@@ -287,13 +299,12 @@ mod tests {
         populate_bucket(&mut postbox, 1, 5);
 
         let assigned = make_assigned(&mut matrix, 1, 1, &[0, 5, 0]);
-        let sig = signals(&assigned, 1, 10);
-        let allocator = GroundAllocator::new(assigned, sig);
-        let (matchings, _assigned, summary) = allocator.run_allocation();
+        let allocator = GroundAllocator::new(assigned);
+        let (matchings, completed) = allocator.run_allocation();
 
         assert!(matchings.is_empty());
-        assert_eq!(summary.successful_matchings, 0);
-        assert_eq!(summary.furthest_bucket_distance, 0);
+        assert_eq!(completed.local_feedback.successful_matchings, 0);
+        assert_eq!(completed.local_feedback.furthest_bucket_distance, 0);
     }
 
     #[test]
@@ -303,12 +314,11 @@ mod tests {
         populate_bucket(&mut postbox, 5, 8);
 
         let assigned = make_assigned(&mut matrix, 3, 2, &[0, 0, 0, 4, 0, 8, 0]);
-        let sig = signals(&assigned, 1, 10);
-        let allocator = GroundAllocator::new(assigned, sig);
-        let (_matchings, _assigned, summary) = allocator.run_allocation();
+        let allocator = GroundAllocator::new(assigned);
+        let (_matchings, completed) = allocator.run_allocation();
 
-        assert_eq!(summary.successful_matchings, 1);
-        assert_eq!(summary.furthest_bucket_distance, 2);
+        assert_eq!(completed.local_feedback.successful_matchings, 1);
+        assert_eq!(completed.local_feedback.furthest_bucket_distance, 2);
     }
 
     #[test]
@@ -318,13 +328,20 @@ mod tests {
         populate_bucket(&mut postbox, 1, 8);
 
         let assigned = make_assigned(&mut matrix, 2, 1, &[0, 8, 4, 0, 0]);
-        let sig = signals(&assigned, 1, 10);
-        let allocator = GroundAllocator::new(assigned, sig);
-        let (_matchings, _assigned, summary) = allocator.run_allocation();
+        let allocator = GroundAllocator::new(assigned);
+        let (_matchings, completed) = allocator.run_allocation();
 
-        assert_eq!(summary.successful_matchings, 1);
-        let anchor_drained = *summary.drained_counts.get_offset(0).unwrap();
-        let widened_drained = *summary.drained_counts.get_offset(-1).unwrap();
+        assert_eq!(completed.local_feedback.successful_matchings, 1);
+        let anchor_drained = *completed
+            .local_feedback
+            .drained_counts
+            .get_offset(0)
+            .unwrap();
+        let widened_drained = *completed
+            .local_feedback
+            .drained_counts
+            .get_offset(-1)
+            .unwrap();
         assert_eq!(anchor_drained + widened_drained, 10);
     }
 
@@ -334,11 +351,40 @@ mod tests {
         populate_bucket(&mut postbox, 1, 20);
 
         let assigned = make_assigned(&mut matrix, 1, 0, &[0, 20, 0]);
-        let sig = signals(&assigned, 1, 10);
-        let allocator = GroundAllocator::new(assigned, sig);
-        let (_matchings, assigned, _summary) = allocator.run_allocation();
+        let allocator = GroundAllocator::new(assigned);
+        let (_matchings, completed) = allocator.run_allocation();
 
-        let remaining = assigned.lease.try_peek(0).unwrap();
+        let remaining = completed.lease.as_ref().unwrap().try_peek(0).unwrap();
         assert_eq!(remaining.request_id, 11);
+    }
+
+    #[test]
+    fn completion_timestamp_is_set_after_allocation() {
+        let (mut matrix, mut postbox) = RequestMatrix::new(1, 20);
+        populate_bucket(&mut postbox, 0, 10);
+
+        let assigned = make_assigned(&mut matrix, 0, 0, &[10]);
+        let allocator = GroundAllocator::new(assigned);
+        let (_matchings, completed) = allocator.run_allocation();
+
+        assert!(completed.local_feedback.completion_timestamp > Duration::ZERO);
+    }
+
+    #[test]
+    fn multi_match_run_produces_only_one_cross_bucket_match() {
+        let (mut matrix, mut postbox) = RequestMatrix::new(3, 30);
+        populate_bucket(&mut postbox, 0, 25);
+        populate_bucket(&mut postbox, 1, 10);
+
+        let mut assigned = make_assigned(&mut matrix, 0, 1, &[25, 10, 0]);
+        assigned.ground_allocation_control_signals.maximum_matchings = 3;
+
+        let allocator = GroundAllocator::new(assigned);
+        let (matchings, completed) = allocator.run_allocation();
+
+        // 2 anchor-local + 1 cross-bucket = 3
+        assert_eq!(matchings.len(), 3);
+        assert_eq!(completed.local_feedback.successful_matchings, 3);
+        assert!(completed.local_feedback.furthest_bucket_distance > 0);
     }
 }
