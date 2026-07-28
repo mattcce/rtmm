@@ -2,7 +2,6 @@
 //! function.
 
 use std::collections::VecDeque;
-use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Select, Sender};
 use log::{debug, error, info, warn};
@@ -80,10 +79,10 @@ pub fn setup(setup_parameters: SetupParameters) {
         info!("Setup spawned ground allocator {id}.")
     }
 
-    let (control_sender, control_receiver) = crossbeam_channel::unbounded::<ControlEvent>();
+    let (_control_sender, control_receiver) = crossbeam_channel::unbounded::<ControlEvent>();
 
     // start scheduler thread
-    std::thread::spawn(move || {
+    let _scheduler_handle = std::thread::spawn(move || {
         scheduler_loop(SchedulerInitialisation {
             ground_allocator_thread_count,
             ground_allocation_channel_pairs: scheduler_channel_pairs.into_boxed_slice(),
@@ -93,9 +92,11 @@ pub fn setup(setup_parameters: SetupParameters) {
         })
     });
 
-    // current thread becomes controller
-    std::thread::sleep(Duration::from_secs(100));
-    control_sender.send(ControlEvent::Shutdown).unwrap();
+    // Controller thread — blocks until process receives SIGINT/SIGTERM.
+    // The OS terminates the process; all threads and sockets are cleaned up.
+    // Graceful shutdown via ControlEvent::Shutdown is available for a future
+    // orchestrator binary with proper signal handling.
+    std::thread::park();
 }
 
 pub fn scheduler_loop(initialisation: SchedulerInitialisation) {
