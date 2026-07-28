@@ -24,7 +24,7 @@ We turn to the most popular online titles of today to gather some base statistic
 - Apex Legends: ~620k CCU
 - Marvel Rivals (excluding China): ~640k CCU
 
->[!info] Reliable Estimation
+>_On reliable estimation of scale_
 >
 >Reliable estimates and historical CCU data for games are remarkably difficult to source and analyse, especially if they operate on platforms other than Steam. Steam provides full time-series historical CCU data, while almost every other large game company obscures said data and have a significant or entire portion of their player base play on their proprietary distribution platforms (data not captured on Steam).
 >
@@ -78,22 +78,26 @@ To measure the 'badness' of a game with players of mismatched skill ratings, we 
 
 Therefore, we design the most general metric for rating mismatch badness to be
 
-$ C(R) = sum_(S, T subset.eq R) phi(S, T), $
+$$
+C(R) = \sum_{S, T \subseteq R} \phi(S, T),
+$$
 
-where $R$ is a sequence of ratings $r_1, r_2, ..., r_n$ and $phi$ produces the mismatch cost between any two subsets of players in a game. We require that $phi$ is commutative; that is, $phi(S, T) = phi(T, S)$ for any $S, T subset.eq R$.
+where $R$ is a sequence of ratings $r_1, r_2, ..., r_n$ and $\phi$ produces the mismatch cost between any two subsets of players in a game. We require that $\phi$ is commutative; that is, $\phi(S, T) = \phi(T, S)$ for any $S, T \subseteq R$.
 
 In reality, the interactions that are most significant can be boiled down to two kinds:
 1. Player-Player Interactions: in games like CS2, Rainbow 6 Siege, etc. characterised by one-on-one skirmishes, player-player interactions tend to dominate. In such cases, the effect is worst felt when there are mismatches between player skill ratings.
 2. Team-Team Interactions: in games like Overwatch, DotA 2, etc. characterised by teamfights, team-team interactions tend to dominate. In such cases, the effect is worst felt when there are mismatches between aggregate team ratings.
 
-In the first case, we only need to primarily consider pairwise interactions between players, combined with some smaller contribution from aggregations across teams. One easy statistical measure to use is the population variance in $R$, $Var(R)$.
+In the first case, we only need to primarily consider pairwise interactions between players, combined with some smaller contribution from aggregations across teams. One easy statistical measure to use is the population variance in $R$, $\operatorname{Var}(R)$.
 
-In the second case, we only need to primarily consider differences across teams after aggregation, combined with some smaller contribution from pairwise interactions. As we have it, $Var(R)$ also happens to account for this well enough, but a more apparent problem looms: $R$ is not yet split into teams, so we can't consider this just yet; in fact, we shouldn't, as this is up to the match splitter algorithm (the one that forms the teams given a matched set of players).
+In the second case, we only need to primarily consider differences across teams after aggregation, combined with some smaller contribution from pairwise interactions. As we have it, $\operatorname{Var}(R)$ also happens to account for this well enough, but a more apparent problem looms: $R$ is not yet split into teams, so we can't consider this just yet; in fact, we shouldn't, as this is up to the match splitter algorithm (the one that forms the teams given a matched set of players).
 
-As a replacement, we consider a secondary measure: the range of $R$, defined to be $max R - min R$. This gives us a good measure of maximum spread, and together with $Var(R)$, gives a very good summary of a matching's general quality by combining multiple spread measures.
+As a replacement, we consider a secondary measure: the range of $R$, defined to be $\max R - \min R$. This gives us a good measure of maximum spread, and together with $\operatorname{Var}(R)$, gives a very good summary of a matching's general quality by combining multiple spread measures.
 
 We can fine-tune the contributions from simpler variability measures to get a composite score. This gives us our first usable metric:
 
-$ hat(C)(R) = alpha Var(R) + beta (max R - min R)^gamma, $
+$$
+\hat{C}(R) = \alpha \operatorname{Var}(R) + \beta (\max R - \min R)^\gamma,
+$$
 
-where $alpha > 0, beta > 0, gamma >= 1$ are hyperparameters. This measure is naturally convex. For our cases we can choose $alpha = beta = 1$ and $gamma = 2$ as a good starting point (penalises the most extreme pair disproportionately, while accounting for variance).
+where $\alpha > 0, \beta > 0, \gamma >= 1$ are hyperparameters. This measure is naturally convex. For our cases we can choose $\alpha = \beta = 1$ and $\gamma = 2$ as a good starting point (penalises the most extreme pair disproportionately, while accounting for variance).
