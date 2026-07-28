@@ -19,3 +19,9 @@ statrs = "0.18.0"
 lto = true
 codegen-units = 1
 opt-level = 3
+
+[profile.profiling]
+inherits = "release"
+debug = 2
+lto = false
+strip = "none"
