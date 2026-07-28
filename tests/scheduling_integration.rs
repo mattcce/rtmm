@@ -97,8 +97,7 @@ fn delta_persists_across_successful_matching_cycle() {
     let mut table = SchedulingTable::new(test_queue_parameters());
 
     // post 20 requests to bucket 0: enough for 2 matches
-    let requests: Vec<MatchmakingRequest> =
-        (1..=20).map(|i| request(i, 50)).collect();
+    let requests: Vec<MatchmakingRequest> = (1..=20).map(|i| request(i, 50)).collect();
     table.post_request_batch(requests).unwrap();
 
     // set delta to 1 before first assignment to simulate prior resize

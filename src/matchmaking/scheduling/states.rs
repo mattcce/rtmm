@@ -589,11 +589,15 @@ mod tests {
 
         let completed = new_empty_ticket(0)
             .ready()
-            .assigned(lease, GroundAllocationControlSignals {
-                maximum_matchings: 1,
-                requests_per_matching: 10,
-                window_eligible_request_counts: OffsetIndexedSlice::from_slice(&[1usize], 0, 0).unwrap(),
-            })
+            .assigned(
+                lease,
+                GroundAllocationControlSignals {
+                    maximum_matchings: 1,
+                    requests_per_matching: 10,
+                    window_eligible_request_counts: OffsetIndexedSlice::from_slice(&[1usize], 0, 0)
+                        .unwrap(),
+                },
+            )
             .complete(summary);
 
         let _ = completed.wait(Duration::from_secs(5));

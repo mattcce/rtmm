@@ -70,8 +70,7 @@ fn residency_cycle_exhausts_bucket_then_goes_empty() {
     let mut table = SchedulingTable::new(test_queue_parameters());
 
     // 30 requests to bucket 0 → should yield 3 matches (10 each) then empty
-    let requests: Vec<MatchmakingRequest> =
-        (1..=30).map(|i| request(i, 50)).collect();
+    let requests: Vec<MatchmakingRequest> = (1..=30).map(|i| request(i, 50)).collect();
     table.post_request_batch(requests).unwrap();
 
     // 1st match
