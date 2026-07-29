@@ -14,6 +14,7 @@ fn main() {
 
     const BATCH_COUNT_LIMIT: usize = 100;
     const BATCH_SIZE: usize = 1_000_000;
+    const INTERARRIVAL_TIME: u64 = 1_000;
 
     let mut generator = MatchmakingRequestGenerator::new();
     let start = SystemTime::now();
@@ -25,7 +26,7 @@ fn main() {
 
         info!("Batch {i} sent.");
 
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(INTERARRIVAL_TIME));
     }
 
     println!("Completed in {:?}.", start.elapsed().unwrap());
